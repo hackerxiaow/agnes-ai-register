@@ -104,10 +104,15 @@ def _load_pool_if_changed():
     if m != _pool_state["mtime"]:
         with _rr_lock:
             try:
-                PROXY_POOL[:] = [l.strip() for l in open(_pf) if l.strip()]
-                _rr_idx[0] = 0
-                _pool_state["mtime"] = m
-                print(f"[代理池] 热重载 {len(PROXY_POOL)} 条")
+                newpool = [l.strip() for l in open(_pf) if l.strip()]
+                if len(newpool) < 10:
+                    print("[代理池] 新池过小, 忽略本次重载")
+                    _pool_state["mtime"] = m
+                else:
+                    PROXY_POOL[:] = newpool
+                    _rr_idx[0] = 0
+                    _pool_state["mtime"] = m
+                    print(f"[代理池] 热重载 {len(PROXY_POOL)} 条")
             except Exception:
                 pass
 
