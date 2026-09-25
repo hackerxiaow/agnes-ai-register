@@ -514,6 +514,115 @@ def cguk_poll(sess, timeout=150, interval=5):
 
 
 # ======================================================================
+# 渠道 1.9: temp-mail-org (web2.temp-mail.org 官方API, 域名池随机)
+# ======================================================================
+TMO_H = {"Origin": "https://temp-mail.org", "Referer": "https://temp-mail.org/", "User-Agent": UA}
+
+
+def tmo_create():
+    r = requests.post("https://web2.temp-mail.org/mailbox", headers={**TMO_H, "Accept": "application/json"}, timeout=30)
+    r.raise_for_status()
+    d = r.json()
+    if not d.get("token") or not d.get("mailbox"):
+        raise RuntimeError(f"tmo: 创建失败 {str(d)[:60]}")
+    return {"email": d["mailbox"], "token": d["token"]}
+
+
+def tmo_poll(sess, timeout=150, interval=5):
+    email, token = sess["email"], sess["token"]
+    h = {**TMO_H, "Authorization": f"Bearer {token}", "Accept": "application/json"}
+    start = time.time()
+    while time.time() - start < timeout:
+        r = requests.get("https://web2.temp-mail.org/messages", headers=h, timeout=30)
+        r.raise_for_status()
+        for m in (r.json() or {}).get("messages") or []:
+            body = m.get("bodyPreview") or m.get("body") or ""
+            code = extract_code(m.get("subject", ""), body)
+            if not code and m.get("_id"):
+                dr = requests.get(f"https://web2.temp-mail.org/messages/{m['_id']}", headers=h, timeout=30)
+                if dr.ok:
+                    dd = dr.json()
+                    code = extract_code(dd.get("subject", ""), dd.get("body") or dd.get("bodyPreview") or "")
+            if code:
+                return code
+        print(f"    [轮询] {int(time.time() - start)}s")
+        time.sleep(interval)
+    raise TimeoutError(f"验证码超时 ({timeout}s)")
+
+
+# ======================================================================
+# 渠道 2.0: mailmomy (mailmomy.com, 免建箱 catch-all)
+# ======================================================================
+def mailmomy_domains():
+    r = requests.get("https://mailmomy.com/api/domains/active",
+                     headers={"User-Agent": UA, "Accept": "application/json", "Referer": "https://mailmomy.com/"}, timeout=30)
+    r.raise_for_status()
+    d = r.json()
+    return [x for x in (d if isinstance(d, list) else d.get("domains") or []) if isinstance(x, str)]
+
+
+def mailmomy_create():
+    domains = mailmomy_domains()
+    if not domains:
+        raise RuntimeError("mailmomy: 无可用域名")
+    email = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "@" + random.choice(domains)
+    return {"email": email}
+
+
+def mailmomy_poll(sess, timeout=150, interval=5):
+    email = sess["email"]
+    h = {"User-Agent": UA, "Accept": "application/json", "Referer": "https://mailmomy.com/"}
+    start = time.time()
+    while time.time() - start < timeout:
+        r = requests.get("https://mailmomy.com/api/mail/messages",
+                         params={"to": email, "page": 1, "limit": 20}, headers=h, timeout=30)
+        r.raise_for_status()
+        d = r.json()
+        for m in (d.get("emails") or []) if isinstance(d, dict) else []:
+            body = m.get("message") or m.get("html") or m.get("body") or m.get("text") or ""
+            code = extract_code(m.get("subject") or "", body)
+            if code:
+                return code
+        print(f"    [轮询] {int(time.time() - start)}s")
+        time.sleep(interval)
+    raise TimeoutError(f"验证码超时 ({timeout}s)")
+
+
+# ======================================================================
+# 渠道 2.1: inboxes.com (免建箱 catch-all, 域名动态)
+# ======================================================================
+def inboxes_create():
+    h = {"User-Agent": UA, "Accept": "application/json", "Referer": "https://inboxes.com/", "Origin": "https://inboxes.com"}
+    r = requests.get("https://inboxes.com/api/v2/domain", headers=h, timeout=30)
+    r.raise_for_status()
+    d = r.json()
+    domains = [x for x in (d.get("domains") or []) if isinstance(x, str)]
+    if not domains:
+        raise RuntimeError("inboxes: 无可用域名")
+    email = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "@" + random.choice(domains)
+    return {"email": email}
+
+
+def inboxes_poll(sess, timeout=150, interval=5):
+    email = sess["email"]
+    h = {"User-Agent": UA, "Accept": "application/json", "Referer": "https://inboxes.com/", "Origin": "https://inboxes.com"}
+    start = time.time()
+    while time.time() - start < timeout:
+        r = requests.get(f"https://inboxes.com/api/v2/inbox/{email}", headers=h, timeout=30)
+        r.raise_for_status()
+        d = r.json()
+        rows = d.get("msgs") or d.get("emails") or (d if isinstance(d, list) else [])
+        for m in rows or []:
+            body = m.get("html") or m.get("body") or m.get("text") or m.get("preview") or ""
+            code = extract_code(m.get("subject") or m.get("title") or "", body)
+            if code:
+                return code
+        print(f"    [轮询] {int(time.time() - start)}s")
+        time.sleep(interval)
+    raise TimeoutError(f"验证码超时 ({timeout}s)")
+
+
+# ======================================================================
 # 渠道 2: catchmail (api.catchmail.io, 免鉴权, 三域名轮换)
 # ======================================================================
 CATCHMAIL_DOMAINS = ["catchmail.io", "mailistry.com", "zeppost.com"]
@@ -642,10 +751,11 @@ def mailtm_poll(sess, timeout=120, interval=3):
 CHANNELS = [
     {"name": "catchmail",  "create": catchmail_create, "poll": catchmail_poll},
     {"name": "mail.tm",    "create": mailtm_create,    "poll": mailtm_poll},
-    {"name": "mailtd",     "create": mailtd_create,    "poll": mailtd_poll},
-    {"name": "chatgpt-uk", "create": cguk_create,      "poll": cguk_poll},
-    {"name": "nimail",     "create": nimail_create,    "poll": nimail_poll},
+    {"name": "temp-mail-org", "create": tmo_create,    "poll": tmo_poll},
+    {"name": "mailmomy",   "create": mailmomy_create,  "poll": mailmomy_poll},
+    {"name": "inboxes",    "create": inboxes_create,   "poll": inboxes_poll},
     {"name": "t365",       "create": t365_create,      "poll": t365_poll},
+    {"name": "nimail",     "create": nimail_create,    "poll": nimail_poll},
     {"name": "tenmin",     "create": tenmin_create,    "poll": tenmin_poll},
     {"name": "tgmailer",   "create": tgmailer_create,  "poll": tgmailer_poll},
     {"name": "mffac",      "create": mffac_create,     "poll": mffac_poll},
@@ -816,7 +926,7 @@ def register_one(idx, total):
         ch = sess = None
         ip_waits = 0
         attempt = 0
-        same_retry = False
+        domain_retries = 0
         while True:
             if sess is None:
                 ch = next_channel()
@@ -842,14 +952,14 @@ def register_one(idx, total):
             if attempt >= MAX_CHANNEL_RETRY:
                 print(f"{tag} 所有渠道均发码失败, 跳过")
                 return None
-            if not same_retry and "email domain" in msg:
-                # 域名级频控: 同渠道换下一个域名再试一次
-                same_retry = True
+            if domain_retries < 3 and ("email domain" in msg or "Disposable" in msg
+                                       or "not allowed" in msg or "abusive" in msg):
+                # 域名级问题: 同渠道换下一个域名再试(多域名渠道收益大)
+                domain_retries += 1
                 sess = None
-                print(f"{tag} 域名频控, 同渠道换域名重试 ({attempt}/{MAX_CHANNEL_RETRY})")
-                time.sleep(2)
+                print(f"{tag} 域名问题, 同渠道换域名重试 ({domain_retries}/3)")
+                time.sleep(1)
                 continue
-            same_retry = False
             sess = None
             print(f"{tag} 发码失败({msg[:50]}), 换渠道重试 ({attempt}/{MAX_CHANNEL_RETRY})")
             time.sleep(2)
