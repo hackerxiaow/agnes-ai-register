@@ -622,6 +622,58 @@ def inboxes_poll(sess, timeout=150, interval=5):
     raise TimeoutError(f"验证码超时 ({timeout}s)")
 
 
+
+# ======================================================================
+# 渠道 2.2: temp-mail-io (api.internal.temp-mail.io, 域名随机)
+# ======================================================================
+TIO_H = {"Content-Type": "application/json", "Application-Name": "web",
+         "Application-Version": "4.0.0", "User-Agent": UA,
+         "origin": "https://temp-mail.io", "referer": "https://temp-mail.io/"}
+_tio_cors = None
+
+
+def _tio_headers():
+    global _tio_cors
+    if _tio_cors is None:
+        try:
+            r = requests.get("https://temp-mail.io/en",
+                             headers={"User-Agent": UA}, timeout=30)
+            m = re.search(r'mobileTestingHeader\s*:\s*"([^"]+)"', r.text)
+            _tio_cors = m.group(1) if m else "1"
+        except Exception:
+            _tio_cors = "1"
+    return {**TIO_H, "X-CORS-Header": _tio_cors}
+
+
+def tio_create():
+    r = requests.post("https://api.internal.temp-mail.io/api/v3/email/new",
+                      json={"min_name_length": 10, "max_name_length": 10},
+                      headers=_tio_headers(), timeout=30)
+    r.raise_for_status()
+    d = r.json()
+    if not d.get("email") or not d.get("token"):
+        raise RuntimeError(f"tio: 创建失败 {str(d)[:60]}")
+    return {"email": d["email"], "token": d["token"]}
+
+
+def tio_poll(sess, timeout=150, interval=5):
+    email = sess["email"]
+    h = _tio_headers()
+    start = time.time()
+    while time.time() - start < timeout:
+        r = requests.get(f"https://api.internal.temp-mail.io/api/v3/email/{email}/messages",
+                         headers=h, timeout=30)
+        r.raise_for_status()
+        for m in r.json() if isinstance(r.json(), list) else []:
+            body = m.get("body_html") or m.get("body_text") or ""
+            code = extract_code(m.get("subject", ""), body)
+            if code:
+                return code
+        print(f"    [轮询] {int(time.time() - start)}s")
+        time.sleep(interval)
+    raise TimeoutError(f"验证码超时 ({timeout}s)")
+
+
 # ======================================================================
 # 渠道 2: catchmail (api.catchmail.io, 免鉴权, 三域名轮换)
 # ======================================================================
@@ -759,6 +811,7 @@ CHANNELS = [
     {"name": "tenmin",     "create": tenmin_create,    "poll": tenmin_poll},
     {"name": "tgmailer",   "create": tgmailer_create,  "poll": tgmailer_poll},
     {"name": "mffac",      "create": mffac_create,     "poll": mffac_poll},
+    {"name": "tio",        "create": tio_create,       "poll": tio_poll},
 ]
 _channel_cycle = itertools.cycle(range(len(CHANNELS)))
 _channel_lock = threading.Lock()
@@ -807,7 +860,8 @@ def agnes_request(method, path, params=None, json_body=None, headers=None):
         px = None
         p = next_proxy()
         if p:
-            px = {"http": f"http://{p}", "https": f"http://{p}"}
+            purl = p if "://" in p else f"http://{p}"
+            px = {"http": purl, "https": purl}
         elif AGNES_PROXIES:
             px = AGNES_PROXIES
         try:
