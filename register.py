@@ -20,9 +20,10 @@ Agnes AI 批量注册机 (修复版)
     gmail.com 永远不可能进一次性邮箱黑名单(其收件箱较慢, 作兜底)
   - 保留原 mail.tm 渠道(已修 html 数组 bug)作最后兜底
   - 发码失败(域名频控/进黑名单)自动切换渠道重试
-  - Agnes 侧有 IP 级频控, 如遇 "Too many registration attempts from this IP"
-    可设 AGNES_PROXY 环境变量让 Agnes 请求走本地代理换出口 IP:
-      AGNES_PROXY=http://127.0.0.1:10808 python register.py
+  - Agnes 侧有 IP 级频控(约 5~10 次调用/小时/IP, 发码注册登录建Key都计数):
+      * 根治: 自建 CF Worker 中继并设 AGNES_RELAY=https://你的worker域名
+        (每次请求从不同 CF 出口 IP 发出, 实测彻底绕开 IP 频控)
+      * 临时: AGNES_PROXY=http://127.0.0.1:10808 换本地代理出口 IP
 
 输出: accounts.json (账号邮箱/密码, 每注册成功一个立即落盘)
       CREATE_KEY=1 时额外记录 token/key 到 accounts.json 并写 keys.txt
@@ -38,11 +39,13 @@ import string
 import os
 import threading
 import itertools
+from urllib.parse import urlencode, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REGISTER_COUNT = int(os.environ.get("REGISTER_COUNT", 25))
 THREAD_COUNT = int(os.environ.get("THREAD_COUNT", 1))
-TOKEN_NAME = os.environ.get("TOKEN_NAME", "auto")
+# Key 名称: 环境变量指定则固定, 否则每个账号随机
+TOKEN_NAME = os.environ.get("TOKEN_NAME", "").strip()
 # 是否登录并创建 API Key(1=注册+登录+建Key, 0=只注册账号)
 CREATE_KEY = int(os.environ.get("CREATE_KEY", 1))
 
@@ -67,6 +70,10 @@ AGNES_HEADERS = {
 }
 AGNES_PROXY = os.environ.get("AGNES_PROXY", "").strip()
 AGNES_PROXIES = {"http": AGNES_PROXY, "https": AGNES_PROXY} if AGNES_PROXY else None
+# CF Worker 中继(绕过 Agnes IP 级频控的根治方案):
+#   部署一个把请求转发到 platform-backend.agnes-ai.com 的 Worker,
+#   例如 AGNES_RELAY=https://agnes-relay.cnz.indevs.in
+AGNES_RELAY = os.environ.get("AGNES_RELAY", "").strip()
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
@@ -117,7 +124,144 @@ def extract_code(subject, body):
 
 
 # ======================================================================
-# 渠道 1: catchmail (api.catchmail.io, 免鉴权, 三域名轮换) —— 默认主力
+# 渠道 0: 10minute-one (web.10minutemail.one, 6 域名轮换, 免鉴权仅Bearer)
+# ======================================================================
+TENMIN_DOMAINS = ["xghff.com", "oqqaj.com", "psovv.com", "dbwot.com", "ygwpr.com", "imxwe.com"]
+_tenmin_cycle = itertools.cycle(TENMIN_DOMAINS)
+_tenmin_lock = threading.Lock()
+TENMIN_SITE = "https://10minutemail.one"
+TENMIN_API = "https://web.10minutemail.one/api/v1"
+JWT_RE = re.compile(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$')
+
+
+def _tenmin_token():
+    r = requests.get(f"{TENMIN_SITE}/zh", headers={"User-Agent": UA,
+                     "Accept": "text/html,application/xhtml+xml,*/*"}, timeout=30)
+    r.raise_for_status()
+    m = re.search(r'<script[^>]*\bid="__NUXT_DATA__"[^>]*>([\s\S]*?)</script>', r.text)
+    if not m:
+        raise RuntimeError("tenmin: __NUXT_DATA__ 不存在")
+    arr = json.loads(m.group(1).strip())
+
+    def resolve(v, depth=0):
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < len(arr) and depth < 64:
+            return resolve(arr[v], depth + 1)
+        return v
+
+    for el in arr:
+        if isinstance(el, dict) and "mailServiceToken" in el:
+            t = resolve(el["mailServiceToken"])
+            if isinstance(t, str) and JWT_RE.match(t):
+                return t
+    for el in arr:
+        if isinstance(el, str) and JWT_RE.match(el):
+            return el
+    raise RuntimeError("tenmin: 未找到 mailServiceToken")
+
+
+def tenmin_create():
+    token = _tenmin_token()
+    with _tenmin_lock:
+        domain = next(_tenmin_cycle)
+    local = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    return {"email": f"{local}@{domain}", "token": token}
+
+
+def _tenmin_headers(token):
+    return {"Accept": "*/*", "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json", "Origin": TENMIN_SITE,
+            "Referer": f"{TENMIN_SITE}/", "User-Agent": UA,
+            "X-Request-ID": os.urandom(16).hex(),
+            "X-Timestamp": str(int(time.time()))}
+
+
+def tenmin_poll(sess, timeout=120, interval=4):
+    email, token = sess["email"], sess["token"]
+    start = time.time()
+    fails = 0
+    refreshed = False
+    while time.time() - start < timeout:
+        h = _tenmin_headers(token)
+        try:
+            r = requests.get(f"{TENMIN_API}/mailbox/{requests.utils.quote(email)}",
+                             headers=h, timeout=30)
+            if r.status_code == 401 and not refreshed:
+                # token 偶发失效, 刷新一次再试
+                refreshed = True
+                token = _tenmin_token()
+                time.sleep(interval)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            rows = data if isinstance(data, list) else []
+            for row in rows:
+                body = ""
+                b = row.get("body")
+                if isinstance(b, dict):
+                    body = b.get("html") or b.get("text") or ""
+                elif row.get("html") or row.get("text") or row.get("mail_text"):
+                    body = row.get("html") or row.get("text") or row.get("mail_text")
+                elif row.get("id"):
+                    dr = requests.get(f"{TENMIN_API}/mailbox/{requests.utils.quote(email)}/{row['id']}",
+                                      headers=h, timeout=30)
+                    if dr.ok:
+                        body = str(dr.json())
+                code = extract_code(row.get("subject", ""), body)
+                if code:
+                    return code
+            fails = 0
+        except Exception:
+            fails += 1
+            if fails >= 6:
+                raise
+        print(f"    [轮询] {int(time.time() - start)}s")
+        time.sleep(interval)
+    raise TimeoutError(f"验证码超时 ({timeout}s)")
+
+
+# ======================================================================
+# 渠道 1: tempmail365 (tempmail365.cn, 4 域名轮换, 两个 GET 搞定)
+# ======================================================================
+T365_DOMAINS = ["fengyou.cc", "shop345.com", "nutemail.com", "qvrf.cn"]
+_t365_cycle = itertools.cycle(T365_DOMAINS)
+_t365_lock = threading.Lock()
+T365_BASE = "https://tempmail365.cn/tempemail.php"
+T365_H = {"Accept": "application/json, text/plain, */*", "Referer": "https://tempmail365.cn/",
+          "User-Agent": UA}
+
+
+def t365_create():
+    with _t365_lock:
+        domain = next(_t365_cycle)
+    user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    email = f"{user}@{domain}"
+    r = requests.get(T365_BASE, params={"action": "create_email", "email": email, "domain": domain},
+                     headers=T365_H, timeout=30)
+    r.raise_for_status()
+    if not r.json().get("success"):
+        raise RuntimeError(f"t365: 创建邮箱失败 {r.text[:80]}")
+    return {"email": email}
+
+
+def t365_poll(sess, timeout=120, interval=4):
+    email = sess["email"]
+    start = time.time()
+    while time.time() - start < timeout:
+        r = requests.get(T365_BASE, params={"action": "fetch_mail", "email": email},
+                         headers=T365_H, timeout=30)
+        r.raise_for_status()
+        content = (r.json() or {}).get("content") or ""
+        if content and content != "无邮件":
+            code = extract_code("", content)
+            if code:
+                return code
+        print(f"    [轮询] {int(time.time() - start)}s")
+        time.sleep(interval)
+    raise TimeoutError(f"验证码超时 ({timeout}s)")
+
+
+# ======================================================================
+# 渠道 2: catchmail (api.catchmail.io, 免鉴权, 三域名轮换)
 # ======================================================================
 CATCHMAIL_DOMAINS = ["catchmail.io", "mailistry.com", "zeppost.com"]
 _cm_domain_cycle = itertools.cycle(CATCHMAIL_DOMAINS)
@@ -244,8 +388,10 @@ def mailtm_poll(sess, timeout=120, interval=3):
 
 CHANNELS = [
     {"name": "catchmail",  "create": catchmail_create, "poll": catchmail_poll},
-    {"name": "tgmailer",   "create": tgmailer_create,  "poll": tgmailer_poll},
     {"name": "mail.tm",    "create": mailtm_create,    "poll": mailtm_poll},
+    {"name": "t365",       "create": t365_create,      "poll": t365_poll},
+    {"name": "tenmin",     "create": tenmin_create,    "poll": tenmin_poll},
+    {"name": "tgmailer",   "create": tgmailer_create,  "poll": tgmailer_poll},
 ]
 _channel_cycle = itertools.cycle(range(len(CHANNELS)))
 _channel_lock = threading.Lock()
@@ -259,35 +405,43 @@ def next_channel():
 # ======================================================================
 # Agnes 平台接口
 # ======================================================================
+def agnes_request(method, path, params=None, json_body=None, headers=None):
+    """Agnes 请求统一出口: 优先走中继(每请求不同CF出口IP, 规避IP频控),
+    其次本地代理, 最后直连。"""
+    headers = headers or AGNES_HEADERS
+    if AGNES_RELAY:
+        target = AGNES_BASE_URL + path
+        if params:
+            target += "?" + urlencode(params)
+        url = f"{AGNES_RELAY}/?t={quote(target, safe='')}"
+        return requests.request(method, url, headers=headers,
+                                json=json_body, timeout=30)
+    return requests.request(method, AGNES_BASE_URL + path, params=params,
+                            headers=headers, json=json_body, timeout=30,
+                            proxies=AGNES_PROXIES)
+
+
 def send_code(email):
-    resp = requests.get(
-        f"{AGNES_BASE_URL}/api/verification",
-        headers={**AGNES_HEADERS, "x-user-language": "zh-CN"},
-        params={"email": email, "purpose": "register"},
-        timeout=30, proxies=AGNES_PROXIES,
-    )
+    resp = agnes_request("GET", "/api/verification",
+                         params={"email": email, "purpose": "register"},
+                         headers={**AGNES_HEADERS, "x-user-language": "zh-CN"})
     print(f"    [发送验证码] {resp.status_code} {resp.text[:80] if resp.status_code != 200 else ''}")
     return resp
 
 
 def do_register(email, password, code):
-    resp = requests.post(
-        f"{AGNES_BASE_URL}/api/user/register",
-        headers={**AGNES_HEADERS, "x-user-language": "zh"},
-        json={"email": email, "password": password, "password_confirm": password, "code": code},
-        timeout=30, proxies=AGNES_PROXIES,
-    )
+    resp = agnes_request("POST", "/api/user/register",
+                         headers={**AGNES_HEADERS, "x-user-language": "zh"},
+                         json_body={"email": email, "password": password,
+                                    "password_confirm": password, "code": code})
     print(f"    [注册] {resp.status_code}")
     resp.raise_for_status()
 
 
 def do_login(email, password):
-    resp = requests.post(
-        f"{AGNES_BASE_URL}/api/user/login",
-        headers={**AGNES_HEADERS, "x-user-language": "zh"},
-        json={"username": email, "password": password},
-        timeout=30, proxies=AGNES_PROXIES,
-    )
+    resp = agnes_request("POST", "/api/user/login",
+                         headers={**AGNES_HEADERS, "x-user-language": "zh"},
+                         json_body={"username": email, "password": password})
     print(f"    [登录] {resp.status_code}")
     resp.raise_for_status()
     data = resp.json()
@@ -301,19 +455,23 @@ def do_login(email, password):
     return token
 
 
-def create_key(auth_token):
-    resp = requests.post(
-        f"{AGNES_BASE_URL}/api/token",
-        headers={**AGNES_HEADERS, "x-user-language": "zh-CN", "Authorization": f"Bearer {auth_token}"},
-        json={"name": TOKEN_NAME},
-        timeout=30, proxies=AGNES_PROXIES,
-    )
+def create_key(auth_token, name=None):
+    resp = agnes_request("POST", "/api/token",
+                         headers={**AGNES_HEADERS, "x-user-language": "zh-CN",
+                                  "Authorization": f"Bearer {auth_token}"},
+                         json_body={"name": name or TOKEN_NAME or "auto"})
     print(f"    [创建Key] {resp.status_code}")
     resp.raise_for_status()
     data = resp.json()
     d = data.get("data", {})
     key = d.get("key") or data.get("key")
     return key
+
+
+def rand_key_name():
+    if TOKEN_NAME:
+        return TOKEN_NAME
+    return "k" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
 
 def save(accounts):
@@ -330,6 +488,7 @@ def save(accounts):
     with open(jp, "w", encoding="utf-8") as f:
         json.dump(old, f, ensure_ascii=False, indent=2)
 
+    # keys.txt: 一行一个 API Key
     keys = []
     if os.path.exists(tp):
         with open(tp, "r", encoding="utf-8") as f:
@@ -338,18 +497,29 @@ def save(accounts):
     with open(tp, "w", encoding="utf-8") as f:
         f.write("\n".join(keys) + "\n" if keys else "")
 
-    print(f"[保存] {jp}  {tp}")
+    # accounts.txt: 一行一个 账号----密码
+    ap = "accounts.txt"
+    lines = []
+    if os.path.exists(ap):
+        with open(ap, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip()]
+    lines.extend(f"{a['email']}----{a['password']}" for a in accounts)
+    with open(ap, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n" if lines else "")
+
+    print(f"[保存] {jp} {tp} {ap}")
 
 
 def register_one(idx, total):
     tag = f"[{idx}/{total}]"
     print(f"{tag} 开始")
     try:
-        # 创建邮箱 + 发码。域名级问题(频控/黑名单)→换渠道重试;
-        # IP 级频控→等待窗口后用同一邮箱重试(邮箱不换, 不浪费)
+        # 创建邮箱 + 发码。失败策略: 同渠道重试1次(域名自动轮换) → 换渠道;
+        # IP 级频控 → 等待窗口后用同一邮箱重试(邮箱不换, 不浪费)
         ch = sess = None
         ip_waits = 0
         attempt = 0
+        same_retry = False
         while True:
             if sess is None:
                 ch = next_channel()
@@ -363,15 +533,26 @@ def register_one(idx, total):
                 msg = resp.json().get("message", "")
             except Exception:
                 msg = resp.text[:100]
-            if "from this IP" in msg and ip_waits < 4:
+            if "from this IP" in msg and ip_waits < 8:
+                # 阶梯式等待: 75s → 180s → 5min → 10min → 15min → 20min → 30min → 40min
+                waits = [75, 180, 300, 600, 900, 1200, 1800, 2400]
+                d = waits[min(ip_waits, len(waits) - 1)]
                 ip_waits += 1
-                print(f"{tag} IP级频控, 等75s后同一邮箱重试 ({ip_waits}/4)")
-                time.sleep(75)
+                print(f"{tag} IP级频控, 等{d}s后同一邮箱重试 ({ip_waits}/8)")
+                time.sleep(d)
                 continue
             attempt += 1
             if attempt >= MAX_CHANNEL_RETRY:
                 print(f"{tag} 所有渠道均发码失败, 跳过")
                 return None
+            if not same_retry and "email domain" in msg:
+                # 域名级频控: 同渠道换下一个域名再试一次
+                same_retry = True
+                sess = None
+                print(f"{tag} 域名频控, 同渠道换域名重试 ({attempt}/{MAX_CHANNEL_RETRY})")
+                time.sleep(2)
+                continue
+            same_retry = False
             sess = None
             print(f"{tag} 发码失败({msg[:50]}), 换渠道重试 ({attempt}/{MAX_CHANNEL_RETRY})")
             time.sleep(2)
@@ -380,16 +561,19 @@ def register_one(idx, total):
         print(f"{tag} 验证码={code}")
 
         password = rand_pwd()
-        # 注册接口同样可能撞 IP 级频控, 等待重试
-        for reg_attempt in range(4):
+        # 注册接口同样可能撞 IP 级频控, 阶梯等待重试
+        reg_waits = [75, 180, 300, 600, 900]
+        for reg_attempt in range(len(reg_waits) + 1):
             try:
                 do_register(sess["email"], password, code)
                 break
             except requests.HTTPError as e:
                 body = e.response.text if e.response is not None else ""
-                if e.response is not None and e.response.status_code == 400 and "from this IP" in body and reg_attempt < 3:
-                    print(f"{tag} 注册撞IP频控, 等75s重试 ({reg_attempt + 1}/3)")
-                    time.sleep(75)
+                if (e.response is not None and e.response.status_code == 400
+                        and "from this IP" in body and reg_attempt < len(reg_waits)):
+                    d = reg_waits[reg_attempt]
+                    print(f"{tag} 注册撞IP频控, 等{d}s重试 ({reg_attempt + 1}/{len(reg_waits)})")
+                    time.sleep(d)
                     continue
                 raise
 
@@ -402,7 +586,7 @@ def register_one(idx, total):
                 print(f"{tag} 登录Token为空，跳过")
                 return None
             print(f"{tag} token={token[:40]}...")
-            key = create_key(token)
+            key = create_key(token, rand_key_name())
             print(f"{tag} key={key}")
             account["token"] = token
             account["key"] = key or ""
@@ -418,18 +602,25 @@ def register_one(idx, total):
 
 def run():
     accounts = []
-    proxy_note = f", Agnes走代理 {AGNES_PROXY}" if AGNES_PROXY else ""
-    print(f"注册 {REGISTER_COUNT} 个账号, 线程 {THREAD_COUNT}{proxy_note}")
+    proxy_note = f", Agnes走中继 {AGNES_RELAY}" if AGNES_RELAY else (
+        f", Agnes走代理 {AGNES_PROXY}" if AGNES_PROXY else "")
+    print(f"目标成功注册 {REGISTER_COUNT} 个账号, 线程 {THREAD_COUNT}{proxy_note}")
     if THREAD_COUNT <= 1 or REGISTER_COUNT <= 1:
-        for i in range(REGISTER_COUNT):
-            r = register_one(i + 1, REGISTER_COUNT)
+        successes = 0
+        attempts = 0
+        # 以成功数为准, 失败不占名额; 总尝试次数封顶防止死循环
+        while successes < REGISTER_COUNT and attempts < REGISTER_COUNT * 5:
+            attempts += 1
+            r = register_one(successes + 1, REGISTER_COUNT)
             if r:
+                successes += 1
                 accounts.append(r)
-            if i < REGISTER_COUNT - 1:
-                time.sleep(random.randint(5, 12))
+                if successes < REGISTER_COUNT:
+                    time.sleep(random.randint(5, 12))
     else:
         with ThreadPoolExecutor(max_workers=THREAD_COUNT) as ex:
-            fts = {ex.submit(register_one, i + 1, REGISTER_COUNT): i + 1 for i in range(REGISTER_COUNT)}
+            fts = {ex.submit(register_one, i + 1, REGISTER_COUNT): i + 1 for i in range(REGISTER_COUNT * 2)}
+            done = 0
             for ft in as_completed(fts):
                 idx = fts[ft]
                 try:
