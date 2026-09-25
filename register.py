@@ -37,6 +37,7 @@ import re
 import random
 import string
 import os
+import hashlib
 import threading
 import itertools
 from urllib.parse import urlencode, quote
@@ -379,6 +380,135 @@ def nimail_poll(sess, timeout=120, interval=4):
 
 
 # ======================================================================
+# 渠道 1.7: mail-td (api.mail.td, 域名动态获取, 建号带 PoW)
+# ======================================================================
+MAILTD_H = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": UA}
+
+
+def _mailtd_domains():
+    r = requests.get("https://api.mail.td/api/domains", headers=MAILTD_H, timeout=30)
+    r.raise_for_status()
+    return [d["domain"] for d in r.json().get("domains", []) if not d.get("pro_only")]
+
+
+def _mailtd_pow(address, ts, difficulty):
+    base = address + str(ts)
+    nonce = 0
+    fb = difficulty // 8
+    rb = difficulty % 8
+    mask = (255 << (8 - rb)) & 255 if rb else 0
+    while nonce < 100000000:
+        h = hashlib.sha256((base + str(nonce)).encode()).digest()
+        if h[:fb] == b"\x00" * fb and (rb == 0 or (h[fb] & mask) == 0):
+            return str(nonce)
+        nonce += 1
+    raise RuntimeError("mail-td: PoW 超时")
+
+
+def mailtd_create():
+    domains = _mailtd_domains()
+    if not domains:
+        raise RuntimeError("mail-td: 无可用域名")
+    domain = random.choice(domains)
+    username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    address = f"{username}@{domain}"
+    password = ''.join(random.choices(string.ascii_lowercase + string.digits, k=20))
+    auth_key = hashlib.sha256(password.encode()).hexdigest()
+    addr_lower = address.lower().strip()
+    difficulty, pow_token = 15, None
+    for _ in range(4):
+        ts = int(time.time())
+        body = {"address": address, "auth_key": auth_key,
+                "pow": {"t": ts, "n": _mailtd_pow(addr_lower, ts, difficulty), "d": difficulty}}
+        if pow_token:
+            body["pow"]["token"] = pow_token
+        r = requests.post("https://api.mail.td/api/accounts", json=body, headers=MAILTD_H, timeout=30)
+        result = r.json()
+        if result.get("status") == "retry":
+            difficulty = result.get("required_difficulty", difficulty + 2)
+            pow_token = result.get("token")
+            continue
+        if not r.ok:
+            raise RuntimeError(f"mail-td: 创建失败 {r.status_code} {str(result)[:60]}")
+        if not result.get("address") or not result.get("token"):
+            raise RuntimeError("mail-td: 响应缺字段")
+        return {"email": result["address"], "jwt": result["token"], "id": result["id"]}
+    raise RuntimeError("mail-td: PoW 重试超限")
+
+
+def mailtd_poll(sess, timeout=150, interval=5):
+    email, jwt, acc = sess["email"], sess["jwt"], sess["id"]
+    h = {**MAILTD_H, "Authorization": f"Bearer {jwt}"}
+    start = time.time()
+    while time.time() - start < timeout:
+        r = requests.get(f"https://api.mail.td/api/accounts/{acc}/messages",
+                         params={"page": 1}, headers=h, timeout=30)
+        r.raise_for_status()
+        for m in (r.json().get("messages") or []):
+            code = extract_code(m.get("subject", ""), m.get("html") or m.get("text"))
+            if code:
+                return code
+        print(f"    [轮询] {int(time.time() - start)}s")
+        time.sleep(interval)
+    raise TimeoutError(f"验证码超时 ({timeout}s)")
+
+
+# ======================================================================
+# 渠道 1.8: chatgpt-org-uk (mail.chatgpt.org.uk, 域名动态获取)
+# ======================================================================
+CGUK_H = {"User-Agent": UA, "Accept": "*/*", "Referer": "https://mail.chatgpt.org.uk/zh/",
+          "Origin": "https://mail.chatgpt.org.uk"}
+
+
+def cguk_create():
+    r = requests.get("https://mail.chatgpt.org.uk/api/domains/public", headers=CGUK_H, timeout=30)
+    r.raise_for_status()
+    domains = [d["domain_name"] for d in (r.json().get("data") or {}).get("domains", []) if d.get("is_active") == 1]
+    if not domains:
+        raise RuntimeError("chatgpt-uk: 无可用域名")
+    email = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "@" + random.choice(domains)
+    r = requests.post("https://mail.chatgpt.org.uk/api/inbox-token", json={"email": email},
+                      headers={**CGUK_H, "Content-Type": "application/json"}, timeout=30)
+    gm_sid = ""
+    for c in r.headers.get("Set-Cookie", "").split(","):
+        if "gm_sid=" in c:
+            gm_sid = c.split("gm_sid=")[1].split(";")[0]
+            break
+    d = r.json()
+    if not d.get("success") or not (d.get("auth") or {}).get("token"):
+        raise RuntimeError("chatgpt-uk: inbox-token 失败")
+    return {"email": email, "gm_sid": gm_sid, "inbox": d["auth"]["token"]}
+
+
+def cguk_poll(sess, timeout=150, interval=5):
+    email, gm, tok = sess["email"], sess["gm_sid"], sess["inbox"]
+    h = {**CGUK_H, "Cookie": f"gm_sid={gm}", "x-inbox-token": tok}
+    start = time.time()
+    while time.time() - start < timeout:
+        r = requests.get("https://mail.chatgpt.org.uk/api/emails",
+                         params={"email": email}, headers=h, timeout=30)
+        if r.status_code in (401, 403):
+            ns = cguk_create()
+            sess.update(ns)
+            h = {**CGUK_H, "Cookie": f"gm_sid={ns['gm_sid']}", "x-inbox-token": ns["inbox"]}
+            time.sleep(2)
+            continue
+        r.raise_for_status()
+        d = r.json()
+        rows = d.get("emails") if isinstance(d, dict) else d
+        for m in (rows or []) if isinstance(rows, list) else []:
+            body = m.get("html") or m.get("body") or m.get("text") or ""
+            if isinstance(body, list):
+                body = "\n".join(str(x) for x in body)
+            code = extract_code(m.get("subject", ""), body)
+            if code:
+                return code
+        print(f"    [轮询] {int(time.time() - start)}s")
+        time.sleep(interval)
+    raise TimeoutError(f"验证码超时 ({timeout}s)")
+
+
+# ======================================================================
 # 渠道 2: catchmail (api.catchmail.io, 免鉴权, 三域名轮换)
 # ======================================================================
 CATCHMAIL_DOMAINS = ["catchmail.io", "mailistry.com", "zeppost.com"]
@@ -507,6 +637,8 @@ def mailtm_poll(sess, timeout=120, interval=3):
 CHANNELS = [
     {"name": "catchmail",  "create": catchmail_create, "poll": catchmail_poll},
     {"name": "mail.tm",    "create": mailtm_create,    "poll": mailtm_poll},
+    {"name": "mailtd",     "create": mailtd_create,    "poll": mailtd_poll},
+    {"name": "chatgpt-uk", "create": cguk_create,      "poll": cguk_poll},
     {"name": "nimail",     "create": nimail_create,    "poll": nimail_poll},
     {"name": "t365",       "create": t365_create,      "poll": t365_poll},
     {"name": "tenmin",     "create": tenmin_create,    "poll": tenmin_poll},
