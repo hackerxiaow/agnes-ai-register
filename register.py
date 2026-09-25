@@ -1021,7 +1021,7 @@ def run():
         successes = 0
         attempts = 0
         # 以成功数为准, 失败不占名额; 总尝试次数封顶防止死循环
-        while successes < REGISTER_COUNT and attempts < REGISTER_COUNT * 5:
+        while successes < REGISTER_COUNT and attempts < REGISTER_COUNT * 10:
             attempts += 1
             r = register_one(successes + 1, REGISTER_COUNT)
             if r:
@@ -1029,6 +1029,9 @@ def run():
                 accounts.append(r)
                 if successes < REGISTER_COUNT:
                     time.sleep(random.randint(5, 12))
+            else:
+                # 失败后间歇, 避免低窗口期快速烧完尝试配额
+                time.sleep(45)
     else:
         with ThreadPoolExecutor(max_workers=THREAD_COUNT) as ex:
             fts = {ex.submit(register_one, i + 1, REGISTER_COUNT): i + 1 for i in range(REGISTER_COUNT * 2)}
