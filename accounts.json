@@ -1,10 +1,18 @@
 [
   {
-    "email": "sdkjr1og93w6o6olb@catchmail.io",
-    "password": "4lRtBKRLUEfuaOQ",
+    "email": "sdk62vege73529v2q@catchmail.io",
+    "password": "Mdd83tTpeEE7HfQ",
     "channel": "catchmail",
-    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlZGU1YTU3NS04MTJlLTRkNDUtOWYxMy1iYjA4ODZmZjk2ZDciLCJleHAiOjE3OTI3MzcxNDQsImlhdCI6MTc5MDMxNzk0NH0.0qGEQkdF_RuX7rMbNRUKQElrLvG6zmyZv28beFXwq30",
-    "key": "sk-svPD9PajgJpMLYfB9fqr12Q5SepJDDP3SmAU9rrVLyoL8bpA",
-    "created_at": "2026-09-25 14:32:26"
+    "created_at": "2026-09-25 14:37:17",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlNDg4NGIwOC05ZjllLTRhY2ItYjY5OC02Y2VmNmFhNDQ3YWQiLCJleHAiOjE3OTI3Mzc1MDksImlhdCI6MTc5MDMxODMwOX0.15rfyza3LWNDhbuieGuay4ktjmv-b_nDssHcCMoBB_0",
+    "key": "sk-gvQRrp6rvPOgz4Jzd7GhCM4rcYJClXXJjkVQtIlx6GtLkDFq"
+  },
+  {
+    "email": "yqs0z2y90629@uberip.com",
+    "password": "O3rJn2krFUkVGFQ",
+    "channel": "mail.tm",
+    "created_at": "2026-09-25 14:37:59",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIyNzRlMjUwNS01YTE2LTRjNzctYTg2OS1lZmYwNjk0ZGUxYjQiLCJleHAiOjE3OTI3Mzc1MTQsImlhdCI6MTc5MDMxODMxNH0.MBEziWvQQrqW8UXZdjzfr5KfcOuPF2h_ldGBZCIGmAg",
+    "key": "sk-dqzh4dUyEZsIIpamFZUEx5wEoBUlWXz8lYuTTacfA3k8NZla"
   }
 ]

@@ -24,7 +24,8 @@ Agnes AI 批量注册机 (修复版)
     可设 AGNES_PROXY 环境变量让 Agnes 请求走本地代理换出口 IP:
       AGNES_PROXY=http://127.0.0.1:10808 python register.py
 
-输出: accounts.json (完整账号) + keys.txt (仅 API Key)
+输出: accounts.json (账号邮箱/密码, 每注册成功一个立即落盘)
+      CREATE_KEY=1 时额外记录 token/key 到 accounts.json 并写 keys.txt
 仅供学习使用。
 """
 
@@ -39,9 +40,11 @@ import threading
 import itertools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-REGISTER_COUNT = int(os.environ.get("REGISTER_COUNT", 10))
+REGISTER_COUNT = int(os.environ.get("REGISTER_COUNT", 25))
 THREAD_COUNT = int(os.environ.get("THREAD_COUNT", 1))
 TOKEN_NAME = os.environ.get("TOKEN_NAME", "auto")
+# 是否登录并创建 API Key(1=注册+登录+建Key, 0=只注册账号)
+CREATE_KEY = int(os.environ.get("CREATE_KEY", 1))
 
 # 发码失败时最多换渠道重试次数(渠道池: catchmail 3域名 + tgmailer + mail.tm)
 MAX_CHANNEL_RETRY = 5
@@ -342,38 +345,72 @@ def register_one(idx, total):
     tag = f"[{idx}/{total}]"
     print(f"{tag} 开始")
     try:
-        # 创建邮箱 + 发码, 失败自动换渠道(域名频控/黑名单时触发)
+        # 创建邮箱 + 发码。域名级问题(频控/黑名单)→换渠道重试;
+        # IP 级频控→等待窗口后用同一邮箱重试(邮箱不换, 不浪费)
         ch = sess = None
-        for attempt in range(MAX_CHANNEL_RETRY):
-            ch = next_channel()
-            sess = ch["create"]()
-            print(f"{tag} 渠道={ch['name']} 邮箱={sess['email']}")
-
+        ip_waits = 0
+        attempt = 0
+        while True:
+            if sess is None:
+                ch = next_channel()
+                sess = ch["create"]()
+                print(f"{tag} 渠道={ch['name']} 邮箱={sess['email']}")
             resp = send_code(sess["email"])
             if resp.status_code == 200:
                 break
-            print(f"{tag} 发码失败, 换渠道重试 ({attempt + 1}/{MAX_CHANNEL_RETRY})")
+            msg = ""
+            try:
+                msg = resp.json().get("message", "")
+            except Exception:
+                msg = resp.text[:100]
+            if "from this IP" in msg and ip_waits < 4:
+                ip_waits += 1
+                print(f"{tag} IP级频控, 等75s后同一邮箱重试 ({ip_waits}/4)")
+                time.sleep(75)
+                continue
+            attempt += 1
+            if attempt >= MAX_CHANNEL_RETRY:
+                print(f"{tag} 所有渠道均发码失败, 跳过")
+                return None
+            sess = None
+            print(f"{tag} 发码失败({msg[:50]}), 换渠道重试 ({attempt}/{MAX_CHANNEL_RETRY})")
             time.sleep(2)
-        else:
-            print(f"{tag} 所有渠道均发码失败, 跳过")
-            return None
 
         code = ch["poll"](sess)
         print(f"{tag} 验证码={code}")
 
         password = rand_pwd()
-        do_register(sess["email"], password, code)
-        token = do_login(sess["email"], password)
-        if not token:
-            print(f"{tag} 登录Token为空，跳过")
-            return None
-        print(f"{tag} token={token[:40]}...")
-        key = create_key(token)
-        print(f"{tag} key={key}")
+        # 注册接口同样可能撞 IP 级频控, 等待重试
+        for reg_attempt in range(4):
+            try:
+                do_register(sess["email"], password, code)
+                break
+            except requests.HTTPError as e:
+                body = e.response.text if e.response is not None else ""
+                if e.response is not None and e.response.status_code == 400 and "from this IP" in body and reg_attempt < 3:
+                    print(f"{tag} 注册撞IP频控, 等75s重试 ({reg_attempt + 1}/3)")
+                    time.sleep(75)
+                    continue
+                raise
+
+        account = {"email": sess["email"], "password": password, "channel": ch["name"],
+                   "created_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+        if CREATE_KEY:
+            token = do_login(sess["email"], password)
+            if not token:
+                print(f"{tag} 登录Token为空，跳过")
+                return None
+            print(f"{tag} token={token[:40]}...")
+            key = create_key(token)
+            print(f"{tag} key={key}")
+            account["token"] = token
+            account["key"] = key or ""
+
         print(f"{tag} 完成")
-        return {"email": sess["email"], "password": password, "channel": ch["name"],
-                "token": token, "key": key or "",
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        with lock:
+            save([account])
+        return account
     except Exception as e:
         print(f"{tag} 失败: {e}")
         return None
@@ -389,7 +426,7 @@ def run():
             if r:
                 accounts.append(r)
             if i < REGISTER_COUNT - 1:
-                time.sleep(random.randint(2, 5))
+                time.sleep(random.randint(5, 12))
     else:
         with ThreadPoolExecutor(max_workers=THREAD_COUNT) as ex:
             fts = {ex.submit(register_one, i + 1, REGISTER_COUNT): i + 1 for i in range(REGISTER_COUNT)}
@@ -405,8 +442,6 @@ def run():
                         print(f"[结果] #{idx} 失败")
                 except Exception as e:
                     print(f"[结果] #{idx} 异常: {e}")
-    if accounts:
-        save(accounts)
     print(f"完成 {len(accounts)}/{REGISTER_COUNT}")
 
 
