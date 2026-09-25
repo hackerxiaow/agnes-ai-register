@@ -74,6 +74,15 @@ AGNES_PROXIES = {"http": AGNES_PROXY, "https": AGNES_PROXY} if AGNES_PROXY else 
 #   部署一个把请求转发到 platform-backend.agnes-ai.com 的 Worker,
 #   例如 AGNES_RELAY=https://agnes-relay.cnz.indevs.in
 AGNES_RELAY = os.environ.get("AGNES_RELAY", "").strip()
+# 免费代理池文件(每行 ip:port): 每次 Agnes 请求随机换代理, 频控立即换下一个,
+# 彻底稀释 Agnes 的 IP 级频控。文件由 validate_proxies 预先验证过可达 Agnes。
+PROXY_POOL = []
+_pf = os.environ.get("AGNES_PROXY_FILE", "").strip()
+if _pf:
+    try:
+        PROXY_POOL = [l.strip() for l in open(_pf) if l.strip()]
+    except Exception:
+        PROXY_POOL = []
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
@@ -406,19 +415,41 @@ def next_channel():
 # Agnes 平台接口
 # ======================================================================
 def agnes_request(method, path, params=None, json_body=None, headers=None):
-    """Agnes 请求统一出口: 优先走中继(每请求不同CF出口IP, 规避IP频控),
-    其次本地代理, 最后直连。"""
+    """Agnes 请求统一出口, 优先级: 代理池(每次随机换IP, 频控自动换) >
+    CF Worker 中继 > 本地代理 > 直连。"""
     headers = headers or AGNES_HEADERS
-    if AGNES_RELAY:
-        target = AGNES_BASE_URL + path
-        if params:
-            target += "?" + urlencode(params)
+    target = AGNES_BASE_URL + path + (("?" + urlencode(params)) if params else "")
+
+    if AGNES_RELAY and not PROXY_POOL:
         url = f"{AGNES_RELAY}/?t={quote(target, safe='')}"
         return requests.request(method, url, headers=headers,
                                 json=json_body, timeout=30)
-    return requests.request(method, AGNES_BASE_URL + path, params=params,
-                            headers=headers, json=json_body, timeout=30,
-                            proxies=AGNES_PROXIES)
+
+    tries = 14 if PROXY_POOL else 1
+    last = None
+    for i in range(tries):
+        px = None
+        if PROXY_POOL:
+            p = random.choice(PROXY_POOL)
+            px = {"http": f"http://{p}", "https": f"http://{p}"}
+        elif AGNES_PROXIES:
+            px = AGNES_PROXIES
+        try:
+            resp = requests.request(method, target, headers=headers,
+                                    json=json_body, timeout=30, proxies=px)
+        except requests.RequestException:
+            last = None
+            time.sleep(0.4)
+            continue
+        if (resp.status_code == 400 and PROXY_POOL
+                and ("from this IP" in resp.text or "Sending too frequently" in resp.text)):
+            last = resp
+            time.sleep(0.6)
+            continue
+        return resp
+    if last is not None:
+        return last
+    raise RuntimeError("Agnes 请求全部失败(代理池均不可用)")
 
 
 def send_code(email):
@@ -533,7 +564,7 @@ def register_one(idx, total):
                 msg = resp.json().get("message", "")
             except Exception:
                 msg = resp.text[:100]
-            if "from this IP" in msg and ip_waits < 8:
+            if (("from this IP" in msg) or ("Sending too frequently" in msg)) and ip_waits < 8:
                 # 阶梯式等待: 75s → 180s → 5min → 10min → 15min → 20min → 30min → 40min
                 waits = [75, 180, 300, 600, 900, 1200, 1800, 2400]
                 d = waits[min(ip_waits, len(waits) - 1)]
