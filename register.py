@@ -83,6 +83,43 @@ if _pf:
         PROXY_POOL = [l.strip() for l in open(_pf) if l.strip()]
     except Exception:
         PROXY_POOL = []
+_rr_lock = threading.Lock()
+_rr_idx = [0]
+_pool_state = {"mtime": 0.0, "path": _pf, "last_check": 0.0}
+
+
+def _load_pool_if_changed():
+    """代理文件热重载: 每 30 秒检查一次 mtime, 变了就整池替换(轮询下标归零)"""
+    if not _pf:
+        return
+    now = time.time()
+    if now - _pool_state["last_check"] < 30:
+        return
+    _pool_state["last_check"] = now
+    try:
+        m = os.path.getmtime(_pf)
+    except OSError:
+        return
+    if m != _pool_state["mtime"]:
+        with _rr_lock:
+            try:
+                PROXY_POOL[:] = [l.strip() for l in open(_pf) if l.strip()]
+                _rr_idx[0] = 0
+                _pool_state["mtime"] = m
+                print(f"[代理池] 热重载 {len(PROXY_POOL)} 条")
+            except Exception:
+                pass
+
+
+def next_proxy():
+    """轮询取代理(均匀消耗, 避免随机撞热), 空池返回 None"""
+    _load_pool_if_changed()
+    if not PROXY_POOL:
+        return None
+    with _rr_lock:
+        p = PROXY_POOL[_rr_idx[0] % len(PROXY_POOL)]
+        _rr_idx[0] += 1
+        return p
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
@@ -270,6 +307,78 @@ def t365_poll(sess, timeout=120, interval=4):
 
 
 # ======================================================================
+# 渠道 1.5: mffac (www.mffac.com, 免鉴权 JSON API, 域名 mffac.com 干净)
+# ======================================================================
+MFFAC_H = {"User-Agent": UA, "Content-Type": "application/json", "Accept": "*/*",
+           "Origin": "https://www.mffac.com", "Referer": "https://www.mffac.com/"}
+MFFAC_GET = {k: v for k, v in MFFAC_H.items() if k != "Content-Type"}
+
+
+def mffac_create():
+    r = requests.post("https://www.mffac.com/api/mailboxes",
+                      json={"expiresInHours": 24}, headers=MFFAC_H, timeout=30)
+    r.raise_for_status()
+    d = r.json()
+    if not d.get("success") or not d.get("mailbox"):
+        raise RuntimeError(f"mffac: 创建失败 {str(d)[:80]}")
+    return {"email": f"{d['mailbox']['address']}@mffac.com"}
+
+
+def mffac_poll(sess, timeout=120, interval=4):
+    addr = sess["email"].split("@")[0]
+    start = time.time()
+    while time.time() - start < timeout:
+        r = requests.get(f"https://www.mffac.com/api/mailboxes/{addr}/emails",
+                         headers=MFFAC_GET, timeout=30)
+        r.raise_for_status()
+        d = r.json()
+        for m in (d.get("emails") or []) if isinstance(d, dict) else []:
+            code = extract_code(m.get("subject", ""), m.get("htmlContent") or m.get("textContent"))
+            if code:
+                return code
+        print(f"    [轮询] {int(time.time() - start)}s")
+        time.sleep(interval)
+    raise TimeoutError(f"验证码超时 ({timeout}s)")
+
+
+# ======================================================================
+# 渠道 1.6: nimail (www.nimail.cn, 表单 API, 域名 nimail.cn 干净)
+# ======================================================================
+NIMAIL_H = {"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.nimail.cn", "Referer": "https://www.nimail.cn/"}
+
+
+def nimail_create():
+    name = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    email = f"{name}@nimail.cn"
+    r = requests.post("https://www.nimail.cn/api/applymail",
+                      data={"mail": email}, headers=NIMAIL_H, timeout=30)
+    r.raise_for_status()
+    d = r.json()
+    if d.get("success") != "true" or not d.get("user"):
+        raise RuntimeError(f"nimail: 创建失败 {str(d)[:80]}")
+    return {"email": d["user"]}
+
+
+def nimail_poll(sess, timeout=120, interval=4):
+    email = sess["email"]
+    start = time.time()
+    while time.time() - start < timeout:
+        r = requests.post("https://www.nimail.cn/api/getmails",
+                          data={"mail": email, "time": "0"}, headers=NIMAIL_H, timeout=30)
+        r.raise_for_status()
+        d = r.json()
+        for m in (d.get("mail") or []) if isinstance(d, dict) and d.get("success") == "true" else []:
+            body = m.get("html") or m.get("content") or m.get("text") or ""
+            code = extract_code(m.get("subject") or m.get("title") or "", body)
+            if code:
+                return code
+        print(f"    [轮询] {int(time.time() - start)}s")
+        time.sleep(interval)
+    raise TimeoutError(f"验证码超时 ({timeout}s)")
+
+
+# ======================================================================
 # 渠道 2: catchmail (api.catchmail.io, 免鉴权, 三域名轮换)
 # ======================================================================
 CATCHMAIL_DOMAINS = ["catchmail.io", "mailistry.com", "zeppost.com"]
@@ -398,17 +507,37 @@ def mailtm_poll(sess, timeout=120, interval=3):
 CHANNELS = [
     {"name": "catchmail",  "create": catchmail_create, "poll": catchmail_poll},
     {"name": "mail.tm",    "create": mailtm_create,    "poll": mailtm_poll},
+    {"name": "nimail",     "create": nimail_create,    "poll": nimail_poll},
     {"name": "t365",       "create": t365_create,      "poll": t365_poll},
     {"name": "tenmin",     "create": tenmin_create,    "poll": tenmin_poll},
     {"name": "tgmailer",   "create": tgmailer_create,  "poll": tgmailer_poll},
+    {"name": "mffac",      "create": mffac_create,     "poll": mffac_poll},
 ]
 _channel_cycle = itertools.cycle(range(len(CHANNELS)))
 _channel_lock = threading.Lock()
+# 渠道健康度: 连续收码失败>=2次的渠道跳过10分钟, 避免线程空耗在死渠道上
+_chan_health = {}
+
+
+def _record_poll(name, ok):
+    h = _chan_health.setdefault(name, {"skip_until": 0, "fails": 0})
+    if ok:
+        h["fails"] = 0
+        h["skip_until"] = 0
+    else:
+        h["fails"] = h.get("fails", 0) + 1
+        if h["fails"] >= 2:
+            h["skip_until"] = time.time() + 600
+            print(f"[渠道] {name} 连续{h['fails']}次收码失败, 暂停10分钟")
 
 
 def next_channel():
+    now = time.time()
     with _channel_lock:
-        return CHANNELS[next(_channel_cycle)]
+        start = next(_channel_cycle)
+    order = CHANNELS[start:] + CHANNELS[:start]
+    alive = [c for c in order if _chan_health.get(c["name"], {}).get("skip_until", 0) < now]
+    return random.choice(alive) if alive else random.choice(order)
 
 
 # ======================================================================
@@ -429,8 +558,8 @@ def agnes_request(method, path, params=None, json_body=None, headers=None):
     last = None
     for i in range(tries):
         px = None
-        if PROXY_POOL:
-            p = random.choice(PROXY_POOL)
+        p = next_proxy()
+        if p:
             px = {"http": f"http://{p}", "https": f"http://{p}"}
         elif AGNES_PROXIES:
             px = AGNES_PROXIES
@@ -441,7 +570,7 @@ def agnes_request(method, path, params=None, json_body=None, headers=None):
             last = None
             time.sleep(0.4)
             continue
-        if (resp.status_code == 400 and PROXY_POOL
+        if (resp.status_code == 400 and p
                 and ("from this IP" in resp.text or "Sending too frequently" in resp.text)):
             last = resp
             time.sleep(0.6)
@@ -588,8 +717,13 @@ def register_one(idx, total):
             print(f"{tag} 发码失败({msg[:50]}), 换渠道重试 ({attempt}/{MAX_CHANNEL_RETRY})")
             time.sleep(2)
 
-        code = ch["poll"](sess)
-        print(f"{tag} 验证码={code}")
+        try:
+            code = ch["poll"](sess)
+            _record_poll(ch["name"], True)
+            print(f"{tag} 验证码={code}")
+        except Exception as e:
+            _record_poll(ch["name"], False)
+            raise
 
         password = rand_pwd()
         # 注册接口同样可能撞 IP 级频控, 阶梯等待重试
